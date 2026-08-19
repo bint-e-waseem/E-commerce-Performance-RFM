@@ -1,0 +1,150 @@
+"""
+Generates realistic seed data for the E-commerce RFM project.
+
+Rather than pure random noise, users are generated from archetypes
+(Champion, Loyal, New, At-Risk, Hibernating, One-and-Done) so that the
+resulting RFM segmentation query has a genuine, varied population to
+score against -- exactly like a real store's customer base.
+
+Analysis "as of" date is fixed at 2026-08-19 so results are reproducible.
+"""
+import random
+import datetime as dt
+
+random.seed(42)
+
+AS_OF = dt.date(2026, 8, 19)
+COUNTRIES = ["USA", "UK", "Canada", "Germany", "France", "Australia", "India", "Pakistan", "UAE", "Brazil"]
+CATEGORIES = ["Electronics", "Apparel", "Home & Kitchen", "Beauty", "Sports & Outdoors", "Books", "Toys"]
+
+def rand_date(start: dt.date, end: dt.date) -> dt.date:
+    delta = (end - start).days
+    if delta <= 0:
+        return start
+    return start + dt.timedelta(days=random.randint(0, delta))
+
+# ---------------------------------------------------------------------------
+# Products
+# ---------------------------------------------------------------------------
+products = []
+pid = 1
+for cat in CATEGORIES:
+    for _ in range(8):
+        cost = round(random.uniform(4, 150), 2)
+        products.append((pid, cat, cost))
+        pid += 1
+N_PRODUCTS = len(products)
+
+# ---------------------------------------------------------------------------
+# Users + archetypes
+# ---------------------------------------------------------------------------
+# archetype: (count, order_count_range, recency_days_range_for_last_order, spacing_days_range)
+archetypes = {
+    "champion":     dict(n=15, orders=(8, 16),  last_order_days=(1, 20),    spacing=(10, 35)),
+    "loyal":        dict(n=18, orders=(5, 9),   last_order_days=(5, 45),    spacing=(20, 55)),
+    "new_customer": dict(n=12, orders=(1, 2),   last_order_days=(1, 25),    spacing=(10, 20)),
+    "at_risk":      dict(n=14, orders=(4, 9),   last_order_days=(90, 160),  spacing=(20, 45)),
+    "hibernating":  dict(n=16, orders=(2, 5),   last_order_days=(180, 400), spacing=(30, 70)),
+    "one_and_done": dict(n=15, orders=(1, 1),   last_order_days=(60, 500),  spacing=(0, 0)),
+}
+
+users = []
+orders = []
+order_items = []
+user_id = 1
+order_id = 1
+order_item_id = 1
+
+for archetype, cfg in archetypes.items():
+    for _ in range(cfg["n"]):
+        # signup date must be before their first order; give plenty of headroom
+        signup = AS_OF - dt.timedelta(days=random.randint(200, 900))
+        country = random.choice(COUNTRIES)
+        users.append((user_id, signup.isoformat(), country))
+
+        n_orders = random.randint(*cfg["orders"])
+        last_order_date = AS_OF - dt.timedelta(days=random.randint(*cfg["last_order_days"]))
+        # make sure last order is after signup
+        if last_order_date < signup:
+            last_order_date = signup + dt.timedelta(days=random.randint(5, 30))
+
+        # build order dates walking backwards from the last order
+        order_dates = [last_order_date]
+        cur = last_order_date
+        for _ in range(n_orders - 1):
+            gap = random.randint(*cfg["spacing"]) if cfg["spacing"] != (0, 0) else 30
+            cur = cur - dt.timedelta(days=gap)
+            if cur < signup:
+                break
+            order_dates.append(cur)
+        order_dates.sort()
+
+        # value profile per archetype (champions/loyal skew higher basket size)
+        if archetype in ("champion",):
+            aov_range = (80, 260)
+        elif archetype in ("loyal", "at_risk"):
+            aov_range = (40, 150)
+        else:
+            aov_range = (15, 90)
+
+        for od in order_dates:
+            # occasionally an order is cancelled/refunded -- should be excluded from RFM
+            status = random.choices(["completed", "cancelled", "refunded"], weights=[92, 4, 4])[0]
+
+            n_items = random.randint(1, 4)
+            items = []
+            total = 0.0
+            for _ in range(n_items):
+                p = random.choice(products)
+                qty = random.randint(1, 3)
+                # price marked up from cost
+                price = round(p[2] * random.uniform(1.3, 2.2), 2)
+                items.append((p[0], qty, price))
+                total += qty * price
+
+            # nudge total to roughly match the archetype's AOV band for realism
+            scale = random.uniform(*aov_range) / max(total, 1)
+            total = round(total * scale, 2)
+            items = [(pid_, qty, round(price * scale, 2)) for (pid_, qty, price) in items]
+
+            orders.append((order_id, user_id, od.isoformat(), total, status))
+            for (pid_, qty, price) in items:
+                order_items.append((order_item_id, order_id, pid_, qty, price))
+                order_item_id += 1
+            order_id += 1
+
+        user_id += 1
+
+N_USERS = user_id - 1
+
+# ---------------------------------------------------------------------------
+# Write SQL insert file
+# ---------------------------------------------------------------------------
+def sql_str(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+with open("/home/claude/rfm_project/02_seed_data.sql", "w") as f:
+    f.write("-- ============================================================================\n")
+    f.write("-- 02_seed_data.sql -- Generated sample data\n")
+    f.write(f"-- Users: {N_USERS} | Products: {N_PRODUCTS} | Orders: {len(orders)} | Order lines: {len(order_items)}\n")
+    f.write("-- Archetypes blended in: champion, loyal, new_customer, at_risk, hibernating, one_and_done\n")
+    f.write("-- Analysis 'as of' reference date used throughout this project: 2026-08-19\n")
+    f.write("-- ============================================================================\n\n")
+
+    f.write("INSERT INTO Users (user_id, signup_date, country) VALUES\n")
+    f.write(",\n".join(f"({u[0]}, {sql_str(u[1])}, {sql_str(u[2])})" for u in users))
+    f.write(";\n\n")
+
+    f.write("INSERT INTO Products (product_id, category, cost) VALUES\n")
+    f.write(",\n".join(f"({p[0]}, {sql_str(p[1])}, {p[2]})" for p in products))
+    f.write(";\n\n")
+
+    f.write("INSERT INTO Orders (order_id, user_id, order_date, total_amount, status) VALUES\n")
+    f.write(",\n".join(f"({o[0]}, {o[1]}, {sql_str(o[2])}, {o[3]}, {sql_str(o[4])})" for o in orders))
+    f.write(";\n\n")
+
+    f.write("INSERT INTO Order_Items (order_item_id, order_id, product_id, quantity, price) VALUES\n")
+    f.write(",\n".join(f"({oi[0]}, {oi[1]}, {oi[2]}, {oi[3]}, {oi[4]})" for oi in order_items))
+    f.write(";\n")
+
+print(f"Generated {N_USERS} users, {N_PRODUCTS} products, {len(orders)} orders, {len(order_items)} order lines")
